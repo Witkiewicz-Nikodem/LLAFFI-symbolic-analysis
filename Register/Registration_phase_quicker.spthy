@@ -1,0 +1,225 @@
+theory LAAFFI_registration_phase
+/*
+ *  Author: Nikodem Witkiewicz
+ *  Model Name: Registration_phase.spthy
+ */
+
+ /*  
+    
+     // Tamarin does not deal well with random param selection, so I assume that DL always select all params. Although note that this is possible to capture we can discuss extending this model if I find some time.
+     // The protocol describtion loosly treat AEAD usage.
+        The AEAD's hide unexpected diversity and complexity: https://inria.hal.science/hal-04126116v2/document. 
+        The paper covers known attacks on AEAD's. some AEAD's are prone to attacks by design, but some attacks are possible in consequence of wrong protocol desing or wrong implementation.
+        As the LAAFFI article leaves AEAD's choice, I make it simple as well. I consider perfectly secure AEAD: CAU-SIV-C4 with no implementation flaws.
+    */
+
+////////////////////////////////////
+// Protocol flow
+
+/*
+    CHANGE Protocol's description does not verify HMAC at any point of the flow so I use hash function instead.
+*/
+
+    /*
+        0. DL and Device are provided with the same one time key (otk). I assume (as it is not clearly stated), they posses the same one time Device ID (ot_id).
+
+        1. Device:
+          * gets Parameters: p1 - I simply use one parameter. 
+          * gets Parameters array and P = H(p1)
+          * generates nonce, ad          
+          * compute ciphertext: c = AEAD(otk, nonce, ad, P)
+          * sends: <c,ot_id,nonce, ad>
+          // I skip timestamp 
+
+        2. DL:
+          * Receive message.
+          * Accepts messages only when otId sent matches with one of his remaining otID;
+          * Decrypts message with received nonce and ad, and possesed otk.
+
+          * generates Device ID: D_ID
+          * generates nonce
+          * generates ad
+
+          * computes k = h(hp1) 
+          * encrypt Device ID with new key: c = enc(k,nonce,ad,D_ID)
+          * sends c together with fres nonce and ad.
+
+        3. Device
+          * receive message.
+          * decrypts c using k = h(hp1) and provided nonce, and ad.
+          * Stores new D_ID, and actuall (in model only key); 
+    */
+
+/*
+  DL i public for organisations, so I cover two scenarios. 
+    First, attacker is someone from outside, so he does not have access to DL data.
+    Second, attacker is someone from inside, so he has access to Dl data
+*/
+
+begin
+builtins: hashing
+
+functions: 
+          // AEAD 
+          enc/4, dec/4, true/0, get_n/1, get_ad/1, aead_verify/4
+
+           
+equations: 
+          // AEAD
+          dec(k, n, ad, enc(k, n, ad, m)) = m,
+          aead_verify(k, n, ad, enc(k, n, ad, x)) = true 
+
+rule Init_Device:
+  [Fr(~params), Fr(~id)]
+--[D_params(~params)]->
+  [Device_params(~id,~params)]
+
+rule Init_DL:
+[]--[Only_once()]->[!DL()]
+
+
+// Pre-delivered-secret-key
+// Device and DL preshares the same key K
+
+rule Pre_share_key:
+  [Device_params(~id, params), Fr(~otID), Fr(~otk), !DL()]
+--[]->
+  [Device_otk(~id,~otID,params,~otk)
+  ,Dl_otk(~otk, ~otID)
+  ]
+
+// 1.
+rule Device_send_params:
+let
+    P_array = h(params)
+    k = h(P_array)
+    c = enc(otk, ~nonce, ~ad, P_array)
+    message = <c,~nonce, ~ad, otID>
+in
+[Device_otk(~id, otID, params, otk), Fr(~nonce), Fr(~ad)]
+--[Device_Params_sent(otk,~nonce,~ad,P_array,otID), Device_1_k(k)]->
+[Out(message), Device_1(k)]
+
+
+//2.
+rule DL_registers:
+let
+    ver = aead_verify(otk,nonce_old,ad_old,c_old)
+    P_array = dec(otk,nonce_old,ad_old,c_old)
+    k = h(P_array)
+    c_new = enc(k,~nonce_new,~ad_new,~D_ID)
+    message = <c_new,~nonce_new,~ad_new>
+in
+  [In(<c_old,nonce_old, ad_old, otID>), Dl_otk(otk, otID)
+  ,Fr(~D_ID), Fr(~ad_new), Fr(~nonce_new)]
+--[_restrict(ver = true)
+  ,DL_finish_k(k)
+  ,DL_finish_D_ID(~D_ID)
+  ,DL_finish_otID(otID)]->
+  [!DL_P_array(~D_ID, P_array), Out(message)]
+
+//3 
+rule Device_finish:
+let
+    ver = aead_verify(k,nonce,ad,c)
+    D_ID = dec(k,nonce,ad,c)
+in
+  [In(<c,nonce,ad>), Device_1(k)]
+--[_restrict(ver = true), Device_finish_ID(D_ID), Device_finish_k(k)]->
+  [Device_registered(D_ID,k)]
+
+#ifdef malicious_insider
+  rule mal_get_params:
+  [!DL_P_array(~D_ID, P_array)]--[]->[Out(P_array)]
+#endif
+
+
+restriction Only_once:
+"All #i #j. Only_once()@i & Only_once()@j ==> #i = #j"
+
+//Sanity
+lemma executable: 
+exists-trace
+"Ex k #i. Device_finish_k(k)@i"
+
+lemma EX_Device_key_match_DL_key:
+exists-trace
+"Ex Device_key DL_key D_ID #i #j
+  .DL_finish_k(DL_key)@i & DL_finish_D_ID(D_ID)@i
+  &Device_finish_k(Device_key)@j & Device_finish_ID(D_ID)@j"
+
+
+// properties
+lemma key_secrecy:
+"All k #i. Device_1_k(k)@i ==> not Ex #j. K(k)@j"
+
+// DL_View
+// Relation k <-> D_ID
+lemma DL_k_bind_D_ID:
+"All k D_ID1 D_ID2 #i #j
+  .DL_finish_k(k)@i & DL_finish_D_ID(D_ID1)@i
+  &DL_finish_k(k)@j & DL_finish_D_ID(D_ID2)@j
+  ==> D_ID1 = D_ID2"
+
+lemma DL_D_ID_bin_k:
+"All k1 k2 D_ID #i #j
+  .DL_finish_k(k1)@i & DL_finish_D_ID(D_ID)@i
+  &DL_finish_k(k2)@j & DL_finish_D_ID(D_ID)@j
+  ==> k1 = k2"
+
+// Relation otID <-> D_ID
+lemma DL_k_bind_otID:
+"All k otID1 otID2 #i #j
+  .DL_finish_k(k)@i & DL_finish_otID(otID1)@i
+  &DL_finish_k(k)@j & DL_finish_otID(otID2)@j
+  ==> otID1 = otID2"
+
+lemma DL_otID_bind_k:
+"All k1 k2 otID #i #j
+  .DL_finish_k(k1)@i & DL_finish_otID(otID)@i
+  &DL_finish_k(k2)@j & DL_finish_otID(otID)@j
+  ==> k1 = k2"  
+
+// if above bindings are true, below lemma should be true as well
+lemma No_forks:
+"All k1 otID1 #i
+  .DL_finish_k(k1)@i & DL_finish_otID(otID1)@i
+  ==> (not Ex k2 #j. DL_finish_k(k2)@j & DL_finish_otID(otID1)@j & not k2 = k1)
+    | (not Ex otID2 #j. DL_finish_k(k1)@j & DL_finish_otID(otID2)@j & not otID1 = otID2)"
+
+lemma all_keys_in_DL_come_from_devices_params:
+// we expect key correctness here
+"All key #i
+  . DL_finish_k(key)@i
+  ==> Ex params #j. D_params(params)@j & key = h(h(params))"
+
+lemma all_Device_keys_come_from_devices_params:
+// we expect key correctness here
+"All key #i
+  . Device_finish_k(key)@i
+  ==> Ex params #j. D_params(params)@j & key = h(h(params))"
+
+// now we check binding properties between parties not only for DL
+lemma D_ID_binds_keys:
+"All Device_key DL_key D_ID #i #j
+  .DL_finish_k(DL_key)@i & DL_finish_D_ID(D_ID)@i
+  &Device_finish_k(Device_key)@j & Device_finish_ID(D_ID)@j
+  ==> DL_key = Device_key"
+
+lemma key_bind_D_IDs:
+"All key D_ID1 D_ID2 #i #j
+  .DL_finish_k(key)@i & DL_finish_D_ID(D_ID1)@i
+  &Device_finish_k(key)@j & Device_finish_ID(D_ID2)@j
+  ==> D_ID1 = D_ID2"
+
+lemma all_DL_keys_match_Device_keys1:
+// direction from step 3 to step 2
+"All k #i. Device_finish_k(k)@i
+  ==> Ex #j. DL_finish_k(k)@j"
+
+lemma all_DL_keys_match_Device_keys2:
+// direction from step 2 to step 1
+"All k #i. DL_finish_k(k)@i
+  ==> Ex #j. Device_1_k(k)@j"
+
+end

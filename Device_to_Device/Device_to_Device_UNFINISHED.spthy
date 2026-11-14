@@ -1,0 +1,501 @@
+theory LAAFFI_Device_to_dl_phase
+/*
+ *  Author: Nikodem Witkiewicz
+ *  Model Name: Registration_phase.spthy
+ */
+
+ /*  
+    
+     // Tamarin does not deal well with random param selection, so I assume that DL always select all params. Although note that this is possible to capture we can discuss extending this model if I find some time.
+     // The protocol describtion loosly treat AEAD usage.
+        The AEAD's hide unexpected diversity and complexity: https://inria.hal.science/hal-04126116v2/document. 
+        The paper covers known attacks on AEAD's. some AEAD's are prone to attacks by design, but some attacks are possible in consequence of wrong protocol desing or wrong implementation.
+        As the LAAFFI article leaves AEAD's choice, I make it simple as well. I consider perfectly secure AEAD: CAU-SIV-C4 with no implementation flaws.
+    */
+
+
+begin
+builtins: hashing
+
+functions: 
+          // AEAD 
+          enc/4, dec/4, true/0, aead_verify/4
+
+           
+equations: 
+          // AEAD
+          dec(k, n, ad, enc(k, n, ad, m)) = m,
+          aead_verify(k, n, ad, enc(k, n, ad, x)) = true 
+
+rule Init_Device:
+  [Fr(~params), Fr(~id)]
+--[D_params(~params)]->
+  [Device_params(~id,~params)]
+
+rule Init_DL:
+[]--[Only_once()]->[!DL()]
+
+// Pre-delivered-secret-key
+// Device and DL preshares the same key K
+
+rule Pre_share_key:
+  [Device_params(~id, params), Fr(~otID), Fr(~otk), !DL()]
+--[]->
+  [Device_otk(~id,~otID,params,~otk)
+  ,Dl_otk(~otk, ~otID)
+  ]
+
+// 1.
+rule Device_send_params:
+let
+    // yes, because of simplification its double hash of single value
+    P_array = h(params)
+    k = h(P_array)
+    c = enc(otk, ~nonce, ~ad, P_array)
+    message = <c,~nonce, ~ad, otID>
+in
+[Device_otk(~id, otID, params, otk), Fr(~nonce), Fr(~ad)]
+--[Device_Params_sent(otk,~nonce,~ad,P_array,otID), Device_1_k(k)]->
+[Out(message), Device_1(P_array)]
+
+
+//2.
+rule DL_registers:
+let
+    P_array = dec(otk,nonce_old,ad_old,c_old)
+    k = h(P_array)
+    ver = aead_verify(otk,nonce_old,ad_old,c_old)
+    c_new = enc(k,~nonce_new,~ad_new,~D_ID)
+    message = <c_new,~nonce_new,~ad_new>
+in
+  [In(<c_old,nonce_old, ad_old, otID>), Dl_otk(otk, otID)
+  ,Fr(~D_ID), Fr(~ad_new), Fr(~nonce_new)]
+--[_restrict(ver = true)
+  ,DL_finish_k(k)
+  ,DL_finish_D_ID(~D_ID)
+  ,DL_finish_otID(otID)]->
+  [!DL_P_array(~D_ID, P_array),Out(message)]
+
+//3 
+rule Device_finish:
+let
+    k = h(P_array)
+    ver = aead_verify(k,nonce,ad,c)
+    m = dec(k,nonce,ad,c)
+    D_ID = fst(m)
+    t    = snd(m)
+in
+  [In(<c,nonce,ad>), Device_1(P_array)]
+--[_restrict(ver = true)
+  , Device_finish_ID(D_ID)
+  , Device_finish_k(k)
+  , Device_finish_t(t)
+  , Device_finish_c(c)]->
+  [!Device(D_ID,P_array)]
+
+#ifdef malicious_insider
+  rule mal_get_params:
+  [!DL_P_array(~D_ID, P_array)]--[]->[Out(P_array)]
+#endif
+
+
+/*
+    Here start communication protocols Device to DL.
+    As before, I assume one param. parties just have the same keys and use AEAD, for communication.
+    check Register or README for more details
+*/
+
+/*
+    // ASSUMPTION: because ID is sent over public channel I use it as ad of AEAD.
+
+    Protocol FLOW
+    1. Device A:
+        * gets IDb,
+        * computes key Ka.
+        * generates nonce n
+        * generates timestamp t
+        * encrypt: c = enc(Ka,n,IDa,<IDb,t>)
+        * send: (IDa, n, c)
+
+    2. DL:
+        * receive (IDa, n_old, c_old)
+        * computes key Ka
+        * decrypts <IDb,t_old> = dec(Ka, n_old, IDa, c_old)
+        * verify timestamp t_old
+        * checks permision IDa to IDb
+
+        * computes key Kab = h(P_array_b | IDa | IDb)
+        * computes key Ka2 // in our case it is the same as Ka1
+
+        * generates nonce n_new
+        * generates timestamp t_new
+        * encrypt: c_new = enc(Ka2,n_new,IDa,<Kab,t_new>) // dont send params id's because I operate on one param in the model
+        * send: (IDa,n_new, c_new)                        // probably IDa is not needed
+        
+
+    3. Devica A: 
+    // Device A can not distinguish two this kind of messages
+        * receive: (IDa, n_old, c_old)
+        * computes Ka2 // in our case it is the same as Ka1
+        * decrypts <Kab,t_old> = dec(ka2,n_old,IDa, c_old)
+        * verify timestamp t_old
+        
+        * gets response resp
+        * generates nonce n_new
+        * generates timestamp t_new
+        * encrypt c_new = enc(Kab, n_new, IDb, <m, t_new>)
+
+        * saves IDb and Kab
+        * sends: (IDa, n_new, c_new) // dont send timestamp over insecure channel its pointless.
+
+    4. Device B
+        * receive: (IDa, n_old, c_old)
+        * what means Check timestamp in 1? do it really means check plaintext-sent timestamp? I SKIP THIS
+        * generate key Kab = h(P_array_b | IDa | IDb)
+        * Decrypt <m, t_old> = dec(Kab, n_old, IDb, c_old)
+        * verify timestamp t_old
+        * do something with data m
+        * saves IDa and kab
+
+    5. DA and DB comunicate with each other
+
+
+
+Weak post compromise security - IF keys Kab and PNab compromise, then the adversary can 
+        // słabe post comrpomise security - jeśli klucz Kab oraz PNab wyciekną to atakujący może w dowolnym momencie uzgodnić ten sam klucz z Device B. Zapobiec temu może timestamp wysyłany od DL.
+*/
+
+rule Devices_can_talk:
+// rule creating policy enabling communication between parties
+  [!DL_P_array(D_ID1, P_array1)
+  ,!DL_P_array(D_ID2, P_array2)]
+--[Enable(D_ID1,D_ID2)]->
+  [!Communication_enabled(D_ID1,D_ID2)]
+
+rule Device_learn_ID:
+// rule responsible for capturing a device learning other devices ID
+  [!Device(D_ID1,P_array1),!Device(D_ID2,P_array2)]
+--[]->
+  [!Device_to_Device(D_ID1,P_array1,D_ID2)]
+
+//1
+rule DA_1:
+let
+    k = h(P_array)
+    c = enc(k,~n,IDa,<IDb,~t>)
+in
+  [!Device_to_Device(IDa,P_array,IDb)
+  ,Fr(~n), Fr(~t)]
+--[DA_1_m(<~t>) /* IDb is public */
+  ,DA_1_msg_sent(<~t,IDb>)
+  ,DA_1_ID(IDa)
+  ,DA_1_IDb(IDb)]->
+  [DA_1(IDa,P_array,IDb), Out(<IDa, ~n, c>)]
+
+//2
+rule DL: 
+let
+    ka = h(P_array_a)
+    ver = aead_verify(ka,n_old,IDa,c_old)
+    decrypted = dec(ka,n_old,IDa,c_old)
+    IDb   = fst(decrypted)
+    t_old = snd(decrypted)
+
+    Kab = h(<P_array_b,IDa,IDb>)
+    c_new = enc(ka,~n_new, IDa, <Kab,~t_new>)
+in
+  [In(<IDa, n_old, c_old>)
+  ,!DL_P_array(IDa, P_array_a)
+  ,!DL_P_array(IDb, P_array_b)
+  ,!Communication_enabled(D_ID1,D_ID2)
+  ,Fr(~n_new), Fr(~t_new)]
+--[_restrict((D_ID1 = IDb & D_ID2 = IDa)
+            |(D_ID1 = IDa & D_ID2 = IDb))
+  ,DL_t(t_old)
+  ,Ver(ver)
+  ,DL_rcv_m(<IDb,t_old>)
+  ,DL_ID(IDa)
+  ,DL_m(Kab,~t_new)
+  ,DL_send_m(<Kab,~t_new>)]->
+  [Out(<IDa, ~n_new, c_new>)]
+
+rule DA_3:
+let
+    ka = h(P_array)
+    ver = aead_verify(ka, n_old, IDa, c_old)
+    decrypted   = dec(ka, n_old, IDa, c_old)
+    kab   = fst(decrypted)
+    t_old = snd(decrypted)
+
+    c_new = enc(kab, ~n_new, IDb, <~res,~t_new>)
+in
+  [DA_1(IDa,P_array,IDb)
+  ,In(<IDa, n_old, c_old>)
+  ,Fr(~res), Fr(~n_new), Fr(~t_new)]
+--[DA_3_t(t_old)
+  ,Ver(ver)
+  ,DA_3_m(~res,~t_new)
+  ,DA_3_rcv_m(<kab,t_old>)
+  ,DA_3_received(IDa)
+  ,DA_3_sent_to(IDb)
+  ,DA_3_sent_m(<~res,~t_new>)
+  ,DA_3_kab(kab)]->
+  [!D_to_D(IDa,IDb,kab),Out(<IDa, ~n_new, c_new>)]
+
+rule DB_4:
+let
+  kab = h(<P_array_b,IDa,IDb>)
+  ver = aead_verify(kab, n_old, IDb, c_old) 
+  decrypted   = dec(kab, n_old, IDb, c_old)
+
+  m     = fst(decrypted)
+  t_old = snd(decrypted)
+in 
+  [In(<IDa, n_old, c_old>)
+  ,!Device(IDb, P_array_b)]
+--[Ver(ver)
+  ,DB_4_t(t_old)
+  ,DB_4_rcv_m(<m,t_old>)
+  ,DB_4_received(IDa)
+  ,DB_4_kab(kab)]->
+  [!D_to_D(IDb,IDa,kab)]
+
+
+// 5
+rule D_to_D_send:
+let
+    c = enc(kab,~n,ID1,<~m,~t>)
+in
+  [!D_to_D(ID1,ID2,kab)
+  , Fr(~n), Fr(~t), Fr(~m)]
+--[D_to_D_m(~m,~t)
+  ,D_to_D_sent_m(<~m,~t>)
+  ,D_to_D_from_ID(ID1)
+  ,D_to_D_to_ID(ID2)
+  ,D_to_D_sent_n(~n)]->
+  [Out( <c, ID1,~n>)]
+
+rule D_to_D_rcv:
+let
+    ver = aead_verify(kab,n,ID2,c)
+    decrypted = dec(kab,n,ID2,c)
+    m = fst(decrypted)
+    t = snd(decrypted)
+in
+  [!D_to_D(ID1,ID2,kab)
+  , In(< c, ID2,n>)]
+--[Ver(ver)
+  ,D_to_D_t(t)
+  ,D_to_D_rcv_received(ID1)
+  ,D_to_D_rcv_m(<m,t>)]->
+  []
+
+
+restriction AEAD_verification:
+"All ver #i. Ver(ver)@i ==> ver = true"
+
+restriction Only_once:
+"All #i #j. Only_once()@i & Only_once()@j ==> #i = #j"
+
+// timestamps
+restriction timestamp_unquiness_register_Dv_finish:
+"All t #i #j
+    .Device_finish_t(t)@i 
+    &Device_finish_t(t)@j
+    ==> #i = #j"  
+
+restriction timestamp_unquiness_DL:
+"All t #i #j
+    .DL_t(t)@i 
+    &DL_t(t)@j
+    ==> #i = #j" 
+
+restriction timestamp_unquiness_DA_3:
+"All t #i #j
+    .DA_3_t(t)@i 
+    &DA_3_t(t)@j
+    ==> #i = #j" 
+
+restriction timestamp_unquiness_DB_4:
+"All t #i #j
+    .DB_4_t(t)@i 
+    &DB_4_t(t)@j
+    ==> #i = #j" 
+
+restriction timestamp_unquiness_D_to_D_rcv:
+"All t #i #j
+    .D_to_D_t(t)@i 
+    &D_to_D_t(t)@j
+    ==> #i = #j" 
+
+lemma sources [sources]:
+"All ID1 ID2 #i1 #i2
+  .DA_1_ID(ID1)@i1
+  &DA_1_IDb(ID2)@i2
+  ==> Ex #j1 #j2 
+        .DL_finish_D_ID(ID1)@j1 
+        &DL_finish_D_ID(ID2)@j2"
+
+
+//Sanity
+lemma executable: 
+exists-trace
+"Ex k #i. Device_finish_k(k)@i"
+
+lemma EX_Device_key_match_DL_key:
+exists-trace
+"Ex Device_key DL_key D_ID #i #j
+  .DL_finish_k(DL_key)@i & DL_finish_D_ID(D_ID)@i
+  &Device_finish_k(Device_key)@j & Device_finish_ID(D_ID)@j"
+
+
+// properties
+lemma key_secrecy:
+"All k #i. Device_1_k(k)@i ==> not Ex #j. K(k)@j"
+
+// DL_View
+// Relation k <-> D_ID
+lemma DL_k_bind_D_ID:
+"All k D_ID1 D_ID2 #i #j
+  .DL_finish_k(k)@i & DL_finish_D_ID(D_ID1)@i
+  &DL_finish_k(k)@j & DL_finish_D_ID(D_ID2)@j
+  ==> D_ID1 = D_ID2"
+
+lemma DL_D_ID_bin_k:
+"All k1 k2 D_ID #i #j
+  .DL_finish_k(k1)@i & DL_finish_D_ID(D_ID)@i
+  &DL_finish_k(k2)@j & DL_finish_D_ID(D_ID)@j
+  ==> k1 = k2"
+
+// Relation otID <-> D_ID
+lemma DL_k_bind_otID:
+"All k otID1 otID2 #i #j
+  .DL_finish_k(k)@i & DL_finish_otID(otID1)@i
+  &DL_finish_k(k)@j & DL_finish_otID(otID2)@j
+  ==> otID1 = otID2"
+
+lemma DL_otID_bind_k:
+"All k1 k2 otID #i #j
+  .DL_finish_k(k1)@i & DL_finish_otID(otID)@i
+  &DL_finish_k(k2)@j & DL_finish_otID(otID)@j
+  ==> k1 = k2"  
+
+// if above bindings are true, below lemma should be true as well
+lemma No_forks:
+"All k1 otID1 #i
+  .DL_finish_k(k1)@i & DL_finish_otID(otID1)@i
+  ==> (not Ex k2 #j. DL_finish_k(k2)@j & DL_finish_otID(otID1)@j & not k2 = k1)
+    | (not Ex otID2 #j. DL_finish_k(k1)@j & DL_finish_otID(otID2)@j & not otID1 = otID2)"
+
+lemma all_keys_in_DL_come_from_devices_params:
+// we expect key correctness here
+"All key #i
+  . DL_finish_k(key)@i
+  ==> Ex params #j. D_params(params)@j & key = h(h(params))"
+
+lemma all_Device_keys_come_from_devices_params:
+// we expect key correctness here
+"All key #i
+  . Device_finish_k(key)@i
+  ==> Ex params #j. D_params(params)@j & key = h(h(params))"
+
+// now we check binding properties between parties not only for DL
+lemma D_ID_binds_keys:
+"All Device_key DL_key D_ID #i #j
+  .DL_finish_k(DL_key)@i & DL_finish_D_ID(D_ID)@i
+  &Device_finish_k(Device_key)@j & Device_finish_ID(D_ID)@j
+  ==> DL_key = Device_key"
+
+lemma key_bind_D_IDs:
+"All key D_ID1 D_ID2 #i #j
+  .DL_finish_k(key)@i & DL_finish_D_ID(D_ID1)@i
+  &Device_finish_k(key)@j & Device_finish_ID(D_ID2)@j
+  ==> D_ID1 = D_ID2"
+
+lemma all_DL_keys_match_Device_keys1:
+// direction from step 3 to step 2
+"All k #i. Device_finish_k(k)@i
+  ==> Ex #j. DL_finish_k(k)@j"
+
+lemma all_DL_keys_match_Device_keys2:
+// direction from step 2 to step 1
+"All k #i. DL_finish_k(k)@i
+  ==> Ex #j. Device_1_k(k)@j"
+
+// Sending message lemmas:
+// Sanity checks
+
+lemma Ex_Two_registered_devices:
+exists-trace
+"Ex ID1 ID2 #i #j
+    .Device_finish_ID(ID1)@i
+    &Device_finish_ID(ID2)@j"
+
+
+// Secrecy
+lemma DA_1_m_secrecy:
+"All m #i
+  .DA_1_m(m)@i
+  ==> not Ex #k. K(m)@k"
+
+lemma DL_message_secrecy:
+"All Kab t #i 
+  .DL_m(Kab, t)@i
+  ==> (not Ex #k1 #k2. K(Kab)@k1 & K(t)@k2)"
+
+lemma DA_3_message_secrecy:
+"All res t #i 
+  .DA_3_m(res, t)@i
+  ==> (not Ex #k1 #k2. K(res)@k1 & K(t)@k2)"
+
+lemma D_to_D_m_message_secrecy:
+"All m t #i 
+  .D_to_D_m(m, t)@i
+  ==> (not Ex #k1 #k2. K(m)@k1 & K(t)@k2)"
+
+
+
+//Authentication
+// note that m are fresh, and not known by an adversary as secrecy hold. Therefore the only source of m can be believed sender.
+lemma DL_auth:
+// If the DL receives message and thinks it comes from a Dv_A, then it come from the Dv_A
+"All m D_ID #i 
+  .DL_rcv_m(m)@i & DL_ID(D_ID)@i
+  ==> (Ex #j. DA_1_msg_sent(m)@j & DA_1_ID(D_ID)@j & #j < #i)"
+
+
+lemma DA_3_auth:
+// If a Dv receives message and thinks it comes from a DL, then it come from the DL
+"All m #i 
+  .DA_3_rcv_m(m)@i
+  ==> (Ex #j. DL_send_m(m)@j & #j < #i)"
+
+lemma DB_4_auth:
+// If a Dv receives message and thinks it comes from a DL, then it come from the DL
+"All m D_ID #i 
+  .DB_4_rcv_m(m)@i & DB_4_received(D_ID)@i
+  ==> (Ex #j. DA_3_sent_m(m)@j & DA_3_sent_to(D_ID)@j & #j < #i)"
+
+lemma D_to_D_auth:
+// If a Dv receives message and thinks it comes from a DL, then it come from the DL
+"All m D_ID #i 
+  .D_to_D_rcv_m(m)@i & D_to_D_rcv_received(D_ID)@i
+  ==> (Ex #j. D_to_D_sent_m(m)@j & D_to_D_from_ID(D_ID)@j & #j < #i)"
+
+
+
+// Integrity
+// note that if above auth holds then integrity holds
+// adversary can't provide any cyphertext such that receiver accepts it and the message is not exact message constructed by a sender.
+// Therefore there is no need to write another lemmas
+
+// Freshnes
+// can't tell
+// Time stamps are used to prevent this in this protocol but I skiped this as there is no universal method for timestamps in Tamarin.
+// Without time stamps, adversary can easily perform replay attack
+
+// maximum what I could do is to create fresh value and treat it like a timestamp, and restrict receivers to not accept two messages with the same timestamp, but it would make modelling this property trivial, and not covering timestamps correctly.
+// Besides we know, that Authentication and integrity hold, so adversary can not tamper messages (including timestamps) . Therefore timestamp received are the timestamp sent. Meaning timestamps should work as intended. 
+
+
+end
